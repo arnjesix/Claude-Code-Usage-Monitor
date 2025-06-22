@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.0.11-german] - 2025-06-22
+
+### Added (German Customizations by arnjesix)
+- German installation guide (`INSTALLATION_ERFOLGREICH.md`) with WSL setup instructions
+- Desktop shortcut creation script (`create_desktop_shortcut.ps1`)
+- Quick start batch file (`quick_start.bat`) for Windows users
+- PowerShell start script (`start_monitor.ps1`) with enhanced error handling
+- Bash start script (`start_monitor.sh`) for WSL/Linux compatibility
+- Preserved original `ccusage_monitor.py` alongside new `claude_monitor.py`
+- Session state persistence for better monitoring continuity
+
+### Changed
+- Enhanced .gitignore to include comprehensive Python project exclusions
+- Merged upstream changes while preserving German customizations
+
 ## [1.0.11] - 2025-06-22
 
 ### Changed
