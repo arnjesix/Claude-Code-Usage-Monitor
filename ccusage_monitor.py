@@ -227,8 +227,8 @@ def load_session_state():
         return None
 
 
-def save_session_state(session_start_time):
-    """Save the current session state to file."""
+def save_session_state(session_start_time, validation_info=None):
+    """Save the current session state to file with optional validation info."""
     state_file = get_session_state_file()
     
     data = {
@@ -236,11 +236,101 @@ def save_session_state(session_start_time):
         'last_updated': datetime.now(timezone.utc).isoformat()
     }
     
+    # Add validation information if provided
+    if validation_info:
+        data['validation'] = validation_info
+    
     try:
         with open(state_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
     except Exception as e:
         print(f"Warning: Could not save session state: {e}")
+
+
+def validate_session_state(blocks, current_time, debug=False):
+    """Validate session state against current ccusage data and fix inconsistencies."""
+    saved_state = load_session_state()
+    validation_result = {
+        'is_valid': True,
+        'issues_found': [],
+        'corrections_made': []
+    }
+    
+    if not saved_state or 'session_start_time' not in saved_state:
+        validation_result['issues_found'].append("No saved session state found")
+        # Try to initialize from current data
+        latest_session, latest_start_time = get_last_session_info(blocks)
+        if latest_session and latest_start_time:
+            save_session_state(latest_start_time, validation_result)
+            validation_result['corrections_made'].append(f"Initialized session state from latest session: {latest_start_time}")
+        validation_result['is_valid'] = False
+        return validation_result
+    
+    saved_session_start = saved_state['session_start_time']
+    saved_reset_time = saved_session_start + timedelta(hours=5)
+    
+    # Check if saved session has expired
+    if current_time > saved_reset_time:
+        validation_result['issues_found'].append(f"Saved session expired at {saved_reset_time}, current time: {current_time}")
+        
+        # Look for newer sessions
+        latest_session, latest_start_time = get_last_session_info(blocks)
+        if latest_session and latest_start_time and latest_start_time > saved_reset_time:
+            save_session_state(latest_start_time, validation_result)
+            validation_result['corrections_made'].append(f"Updated to newer session: {latest_start_time}")
+            validation_result['is_valid'] = False
+        else:
+            validation_result['corrections_made'].append("Marked as ready for new session")
+    
+    # Verify that there are actually sessions within the saved time window
+    sessions_in_window = []
+    window_start = saved_session_start
+    window_end = saved_reset_time
+    
+    for block in blocks:
+        if block.get('isGap', False):
+            continue
+            
+        start_time_str = block.get('startTime')
+        if not start_time_str:
+            continue
+            
+        start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+        
+        if window_start <= start_time <= window_end:
+            sessions_in_window.append((block, start_time))
+    
+    if not sessions_in_window:
+        validation_result['issues_found'].append("No sessions found in saved time window")
+        validation_result['is_valid'] = False
+        
+        # Try to find the closest valid session
+        closest_session, closest_start_time = get_last_session_info(blocks)
+        if closest_session and closest_start_time:
+            save_session_state(closest_start_time, validation_result)
+            validation_result['corrections_made'].append(f"Corrected to closest session: {closest_start_time}")
+    
+    # Check for data consistency
+    if sessions_in_window:
+        sessions_in_window.sort(key=lambda x: x[1])
+        earliest_in_window = sessions_in_window[0][1]
+        
+        # The saved session start should match the earliest session in the window
+        time_diff = abs((saved_session_start - earliest_in_window).total_seconds())
+        if time_diff > 300:  # More than 5 minutes difference
+            validation_result['issues_found'].append(f"Saved session start differs from earliest session by {time_diff/60:.1f} minutes")
+            save_session_state(earliest_in_window, validation_result)
+            validation_result['corrections_made'].append(f"Corrected session start to: {earliest_in_window}")
+            validation_result['is_valid'] = False
+    
+    if debug and (validation_result['issues_found'] or validation_result['corrections_made']):
+        print(f"🔍 Session validation results:")
+        for issue in validation_result['issues_found']:
+            print(f"   ⚠️  Issue: {issue}")
+        for correction in validation_result['corrections_made']:
+            print(f"   ✅ Correction: {correction}")
+    
+    return validation_result
 
 
 def get_last_session_info(blocks):
@@ -268,6 +358,72 @@ def get_last_session_info(blocks):
             latest_start_time = start_time
     
     return latest_session, latest_start_time
+
+
+def get_last_message_time(blocks, current_time):
+    """Find the timestamp of the last message/activity in the current 5-hour session window."""
+    if not blocks:
+        return None
+    
+    # Get the current session window boundaries
+    saved_state = load_session_state()
+    window_start = None
+    window_end = None
+    
+    if saved_state and 'session_start_time' in saved_state:
+        saved_session_start = saved_state['session_start_time']
+        saved_reset_time = saved_session_start + timedelta(hours=5)
+        
+        # Check if the saved session is still valid
+        if current_time < saved_reset_time:
+            window_start = saved_session_start
+            window_end = saved_reset_time
+        else:
+            # Saved session expired, check for new session
+            latest_session, latest_start_time = get_last_session_info(blocks)
+            if latest_session and latest_start_time and latest_start_time > saved_reset_time:
+                window_start = latest_start_time
+                window_end = latest_start_time + timedelta(hours=5)
+    else:
+        # No saved state, use current session
+        latest_session, latest_start_time = get_last_session_info(blocks)
+        if latest_session and latest_start_time:
+            window_start = latest_start_time
+            window_end = latest_start_time + timedelta(hours=5)
+    
+    if not window_start or not window_end:
+        return None
+    
+    # Find the last activity time within the current session window
+    last_activity_time = None
+    
+    for block in blocks:
+        # Skip gaps
+        if block.get('isGap', False):
+            continue
+            
+        start_time_str = block.get('startTime')
+        if not start_time_str:
+            continue
+            
+        start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+        
+        # Check if this session falls within the current window
+        if window_start <= start_time <= window_end:
+            # Determine the effective end time of this session's activity
+            # Always prefer actualEndTime (time of last real message) over current time
+            actual_end_str = block.get('actualEndTime')
+            if actual_end_str:
+                activity_end = datetime.fromisoformat(actual_end_str.replace('Z', '+00:00'))
+            else:
+                # Fallback to start time if no end time available
+                activity_end = start_time
+            
+            # Update last activity time if this is more recent
+            if last_activity_time is None or activity_end > last_activity_time:
+                last_activity_time = activity_end
+    
+    return last_activity_time
 
 
 def get_session_window_info(blocks, current_time):
@@ -319,11 +475,15 @@ def get_session_window_info(blocks, current_time):
     return first_session, first_start_time, last_session, last_start_time
 
 
-def get_session_based_reset_time(current_time, blocks):
+def get_session_based_reset_time(current_time, blocks, debug=False):
     """Calculate reset time based on persistent session state + 5 hours.
     Uses saved session state to maintain consistency across monitor restarts.
+    Now includes automatic validation and correction of session state.
     """
-    # First, try to load the saved session state
+    # First, validate and potentially correct the session state
+    validation_result = validate_session_state(blocks, current_time, debug)
+    
+    # Load the (potentially corrected) session state
     saved_state = load_session_state()
     
     if saved_state and 'session_start_time' in saved_state:
@@ -511,6 +671,8 @@ def parse_args():
                         help='Change the reset hour (0-23) for daily limits')
     parser.add_argument('--timezone', type=str, default='Europe/Warsaw',
                         help='Timezone for reset times (default: Europe/Warsaw). Examples: US/Eastern, Asia/Tokyo, UTC')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug mode with detailed session validation and logging')
     return parser.parse_args()
 
 
@@ -625,11 +787,14 @@ def main():
             # Calculate burn rate from ALL sessions in the last hour
             burn_rate = calculate_hourly_burn_rate(data['blocks'], current_time)
             
-            # Session-based reset time calculation
-            reset_time = get_session_based_reset_time(current_time, data['blocks'])
+            # Session-based reset time calculation with debug support
+            reset_time = get_session_based_reset_time(current_time, data['blocks'], debug=args.debug)
             
             # Get session window information using persistent state
             first_session, first_start_time, last_session, last_start_time = get_persistent_session_window_info(data['blocks'], current_time)
+            
+            # Calculate last message/activity time in current session window
+            last_message_time = get_last_message_time(data['blocks'], current_time)
             
             if reset_time is None:
                 # Ready for new session - show full 5-hour window available
@@ -719,6 +884,28 @@ def main():
                     print(f"📝 {white}First Message:{reset}  {first_start_str}")
                     print(f"📝 {white}Last Message:{reset}   {last_start_str}")
                 
+                # Show last activity time if available
+                if last_message_time:
+                    last_message_local = last_message_time.astimezone(local_tz)
+                    last_message_str = last_message_local.strftime("%H:%M")
+                    # Calculate time since last activity
+                    time_since_last = current_time - last_message_time
+                    minutes_since_last = time_since_last.total_seconds() / 60
+                    
+                    if minutes_since_last < 1:
+                        activity_status = f"{green}active now{reset}"
+                    elif minutes_since_last < 60:
+                        activity_status = f"{yellow}{int(minutes_since_last)}m ago{reset}"
+                    else:
+                        hours_since = int(minutes_since_last // 60)
+                        mins_since = int(minutes_since_last % 60)
+                        if mins_since == 0:
+                            activity_status = f"{red}{hours_since}h ago{reset}"
+                        else:
+                            activity_status = f"{red}{hours_since}h {mins_since}m ago{reset}"
+                    
+                    print(f"💬 {white}Last Activity:{reset}  {last_message_str} ({activity_status})")
+                
                 # Show persistent session info
                 saved_state = load_session_state()
                 if saved_state and 'session_start_time' in saved_state:
@@ -755,13 +942,56 @@ def main():
                 print(f"✅ {green}Session window expired - ready for new 5-hour window!{reset}")
                 print()
             
+            # Debug information (if debug mode is enabled)
+            if args.debug:
+                print(f"🔍 {white}Debug Information:{reset}")
+                
+                # Session count and details
+                total_sessions = len([b for b in data['blocks'] if not b.get('isGap', False)])
+                active_sessions = len([b for b in data['blocks'] if b.get('isActive', False) and not b.get('isGap', False)])
+                print(f"   📋 Total sessions: {total_sessions}, Active: {active_sessions}")
+                
+                # Session state file info
+                saved_state = load_session_state()
+                if saved_state:
+                    session_start = saved_state.get('session_start_time')
+                    last_updated = saved_state.get('last_updated')
+                    if session_start:
+                        session_start_local = session_start.astimezone(local_tz)
+                        print(f"   💾 Session state: {session_start_local.strftime('%Y-%m-%d %H:%M:%S')}")
+                    if last_updated:
+                        updated_dt = datetime.fromisoformat(last_updated).astimezone(local_tz)
+                        print(f"   🔄 Last updated: {updated_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                else:
+                    print(f"   💾 Session state: {red}None found{reset}")
+                
+                # Window boundaries
+                if first_start_time:
+                    window_start_local = first_start_time.astimezone(local_tz)
+                    window_end = first_start_time + timedelta(hours=5)
+                    window_end_local = window_end.astimezone(local_tz)
+                    print(f"   🪟 Window: {window_start_local.strftime('%H:%M')} - {window_end_local.strftime('%H:%M')}")
+                
+                # Validation status
+                validation_result = validate_session_state(data['blocks'], current_time, debug=False)
+                if validation_result['is_valid']:
+                    print(f"   ✅ Session validation: {green}Valid{reset}")
+                else:
+                    issues_count = len(validation_result['issues_found'])
+                    corrections_count = len(validation_result['corrections_made'])
+                    print(f"   ⚠️  Session validation: {yellow}{issues_count} issues, {corrections_count} corrections{reset}")
+                
+                print()
+            
             # Status line
             current_time_str = datetime.now().strftime("%H:%M:%S")
             if is_ready_for_new_session:
                 status_msg = f"{cyan}Waiting for new session...{reset}"
             else:
                 status_msg = f"{cyan}Session active...{reset}"
-            print(f"⏰ {gray}{current_time_str}{reset} 📝 {status_msg} | {gray}Ctrl+C to exit{reset} 🟨")
+            
+            debug_indicator = f" | {gray}Debug: ON{reset}" if args.debug else ""
+            print(f"⏰ {gray}{current_time_str}{reset} 📝 {status_msg}{debug_indicator} | {gray}Ctrl+C to exit{reset} 🟨")
             
             # Clear any remaining lines below to prevent artifacts
             print('\033[J', end='', flush=True)
