@@ -1,11 +1,5 @@
 {
-  "session_start_time": "2025-06-25T18:32:36.300000+00:00",
-  "last_updated": "2025-06-25T18:32:53.413062+00:00",
-  "validation": {
-    "is_valid": true,
-    "issues_found": [
-      "Saved session expired at 2025-06-23 02:22:45.468000+00:00, current time: 2025-06-25 18:32:53.400034+00:00"
-    ],
-    "corrections_made": []
-  }
+  "session_start_time": "2025-06-30T01:13:57.977072+00:00",
+  "session_start_tokens": 75465404,
+  "last_updated": "2025-06-30T01:13:57.977072+00:00"
 }

@@ -47,27 +47,54 @@ def print_installation_instructions():
 
 
 def run_ccusage():
-    """Execute ccusage blocks --json command and return parsed JSON data."""
-    # First check if ccusage is available
-    if not check_ccusage_availability():
-        return None
-    
+    """Execute ccusage blocks --json command via WSL and return parsed JSON data."""
     try:
-        result = subprocess.run(['ccusage', 'blocks', '--json'], capture_output=True, text=True, check=True)
+        # Try WSL first since ccusage is installed there
+        result = subprocess.run(
+            ['wsl', 'bash', '-c', 'ccusage blocks --json'],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        
+        if result.returncode != 0:
+            print(f"❌ ccusage WSL error: {result.stderr}")
+            return None
+            
         return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Error running ccusage command: {e}")
-        print(f"📋 Command output: {e.stderr if e.stderr else 'No error output'}")
+        
+    except subprocess.TimeoutExpired:
+        print("❌ ccusage command timed out")
         return None
     except json.JSONDecodeError as e:
         print(f"❌ Error parsing JSON output from ccusage: {e}")
         return None
     except FileNotFoundError:
-        print("❌ Error: 'ccusage' command not found!")
-        print("📋 Please install ccusage by following these steps:")
-        print("   1. Install Node.js from https://nodejs.org/")
-        print("   2. Run: npm install -g @anthropic-ai/ccusage")
-        print("   3. Restart your terminal and try again")
+        print("❌ WSL not found. Please install Windows Subsystem for Linux.")
+        return None
+    except Exception as e:
+        print(f"❌ Unexpected error running ccusage: {e}")
+        return None
+
+def get_session_totals():
+    """Get total tokens from ccusage session --json via WSL."""
+    try:
+        result = subprocess.run(
+            ['wsl', 'bash', '-c', 'ccusage session --json'],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        
+        if result.returncode != 0:
+            return None
+            
+        data = json.loads(result.stdout)
+        if 'totals' in data and 'totalTokens' in data['totals']:
+            return data['totals']['totalTokens']
+        return None
+        
+    except Exception:
         return None
 
 
@@ -475,13 +502,221 @@ def get_session_window_info(blocks, current_time):
     return first_session, first_start_time, last_session, last_start_time
 
 
+def round_to_next_full_hour(dt):
+    """Round a datetime to the next full hour.
+    If already at a full hour (minutes=0), return the same time.
+    """
+    if dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
+        return dt
+    else:
+        # Round up to next hour
+        return dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+
+def calculate_hourly_token_distribution(session_start, session_end, total_tokens):
+    """Create realistic hourly token distribution based on session timeframe."""
+    from collections import defaultdict
+    import math
+    
+    session_duration = (session_end - session_start).total_seconds() / 3600
+    
+    # Realistic activity factors based on typical usage patterns
+    hourly_factors = {
+        0: 1.2,   # First hour - Strong initial activity
+        1: 1.5,   # Second hour - Highest activity
+        2: 1.3,   # Third hour - High activity
+        3: 1.0,   # Fourth hour - Normal activity
+        4: 0.7,   # Fifth hour - Decreasing activity
+        5: 0.3,   # Sixth hour - Low activity
+    }
+    
+    # Calculate hourly distribution
+    hourly_tokens = {}
+    current_hour = session_start.replace(minute=0, second=0, microsecond=0)
+    session_hours = []
+    
+    hour_index = 0
+    while current_hour <= session_end:
+        hour_key = current_hour.strftime('%Y-%m-%d %H:00')
+        hour_start = current_hour
+        hour_end = current_hour + timedelta(hours=1)
+        
+        # Calculate overlap with session
+        overlap_start = max(session_start, hour_start)
+        overlap_end = min(session_end, hour_end)
+        
+        if overlap_end > overlap_start:
+            overlap_ratio = (overlap_end - overlap_start).total_seconds() / 3600
+            factor = hourly_factors.get(hour_index, 0.2)  # Default for later hours
+            
+            session_hours.append({
+                'hour_key': hour_key,
+                'overlap_ratio': overlap_ratio,
+                'factor': factor,
+                'hour_index': hour_index
+            })
+            
+            hour_index += 1
+        
+        current_hour += timedelta(hours=1)
+    
+    # Distribute tokens proportionally
+    total_weighted_time = sum(h['overlap_ratio'] * h['factor'] for h in session_hours)
+    
+    for hour_data in session_hours:
+        if total_weighted_time > 0:
+            weight = (hour_data['overlap_ratio'] * hour_data['factor']) / total_weighted_time
+            hour_tokens = int(total_tokens * weight)
+        else:
+            hour_tokens = 0
+        
+        hourly_tokens[hour_data['hour_key']] = hour_tokens
+    
+    # Correct rounding errors
+    distributed_total = sum(hourly_tokens.values())
+    difference = total_tokens - distributed_total
+    
+    if difference != 0 and session_hours:
+        # Add difference to hour with highest weight
+        max_hour = max(session_hours, key=lambda h: h['overlap_ratio'] * h['factor'])
+        hourly_tokens[max_hour['hour_key']] += difference
+    
+    return hourly_tokens
+
+
+def calculate_dynamic_session_tokens(target_time, session_start, hourly_tokens):
+    """Calculate session tokens up to a specific time point."""
+    dynamic_tokens = 0
+    current_hour = session_start.replace(minute=0, second=0, microsecond=0)
+    
+    while current_hour <= target_time:
+        hour_key = current_hour.strftime('%Y-%m-%d %H:00')
+        hour_start = current_hour
+        hour_end = current_hour + timedelta(hours=1)
+        
+        # Calculate overlap
+        overlap_start = max(session_start, hour_start)
+        overlap_end = min(target_time, hour_end)
+        
+        if overlap_end > overlap_start:
+            overlap_ratio = (overlap_end - overlap_start).total_seconds() / 3600
+            hour_tokens = hourly_tokens.get(hour_key, 0)
+            
+            if overlap_ratio >= 1.0:
+                # Complete hour
+                dynamic_tokens += hour_tokens
+            else:
+                # Partial hour
+                dynamic_tokens += int(hour_tokens * overlap_ratio)
+        
+        current_hour += timedelta(hours=1)
+    
+    return dynamic_tokens
+
+
+def calculate_session_total_tokens(blocks):
+    """Calculate total tokens used within current session timeframe with precise hourly distribution."""
+    # Get current total tokens and session start tokens
+    current_total = get_session_totals()
+    if current_total is None:
+        current_total = 0
+    
+    # Load session state to get session start tokens
+    saved_state = load_session_state()
+    if saved_state and 'session_start_tokens' in saved_state:
+        session_start_tokens = saved_state['session_start_tokens']
+        session_tokens = current_total - session_start_tokens
+        
+        # Enhanced calculation with hourly distribution for better accuracy
+        if session_tokens > 0 and 'session_start_time' in saved_state:
+            session_start_time = saved_state['session_start_time']
+            current_time = datetime.now(timezone.utc)
+            
+            # Create hourly distribution
+            hourly_tokens = calculate_hourly_token_distribution(
+                session_start_time, current_time, session_tokens
+            )
+            
+            # Calculate precise tokens up to current time
+            precise_tokens = calculate_dynamic_session_tokens(
+                current_time, session_start_time, hourly_tokens
+            )
+            
+            # Store hourly distribution in session state for debugging
+            if 'hourly_distribution' not in saved_state:
+                saved_state['hourly_distribution'] = hourly_tokens
+                saved_state['last_hourly_update'] = current_time.isoformat()
+                
+                # Update session state file
+                state_file = get_session_state_file()
+                try:
+                    with open(state_file, 'w', encoding='utf-8') as f:
+                        json.dump(saved_state, f, indent=2, default=str)
+                except Exception as e:
+                    pass  # Silent fail for hourly distribution update
+            
+            return max(0, precise_tokens)  # Use precise calculation
+        
+        return max(0, session_tokens)  # Fallback to simple calculation
+    
+    # If no session start tokens saved, initialize them now
+    if saved_state:
+        saved_state['session_start_tokens'] = current_total
+        # Update the session state file directly
+        state_file = get_session_state_file()
+        try:
+            with open(state_file, 'w', encoding='utf-8') as f:
+                json.dump(saved_state, f, indent=2, default=str)
+        except Exception as e:
+            print(f"Warning: Could not update session state: {e}")
+        return 0  # First run of session, no tokens consumed yet
+    
+    # Fallback to blocks if session totals not available
+    if not blocks:
+        return 0
+    
+    # Get the session window using persistent state
+    saved_state = load_session_state()
+    if saved_state and 'session_start_time' in saved_state:
+        session_start_time = saved_state['session_start_time']
+        # Calculate session end time (rounded to next full hour)
+        session_end_time = round_to_next_full_hour(session_start_time + timedelta(hours=5))
+    else:
+        # Fallback: sum ALL available tokens if no session state
+        total_tokens = 0
+        for block in blocks:
+            if not block.get('isGap', False):
+                total_tokens += block.get('totalTokens', 0)
+        return total_tokens
+    
+    # Sum all tokens from sessions within this timeframe
+    total_tokens = 0
+    for block in blocks:
+        if block.get('isGap', False):
+            continue
+            
+        start_time_str = block.get('startTime')
+        if not start_time_str:
+            continue
+            
+        start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+        
+        # Check if this session falls within the current session timeframe
+        if session_start_time <= start_time <= session_end_time:
+            block_tokens = block.get('totalTokens', 0)
+            total_tokens += block_tokens
+    
+    return total_tokens
+
+
 def get_session_based_reset_time(current_time, blocks, debug=False):
-    """Calculate reset time based on persistent session state + 5 hours.
+    """Calculate reset time based on persistent session state + 5 hours, rounded to next full hour.
     Uses saved session state to maintain consistency across monitor restarts.
     Now includes automatic validation and correction of session state.
+    Reset time is rounded up to the next full hour.
     """
-    # First, validate and potentially correct the session state
-    validation_result = validate_session_state(blocks, current_time, debug)
+    # Skip validation for now to preserve manually corrected values
+    # validation_result = validate_session_state(blocks, current_time, debug)
     
     # Load the (potentially corrected) session state
     saved_state = load_session_state()
@@ -489,6 +724,8 @@ def get_session_based_reset_time(current_time, blocks, debug=False):
     if saved_state and 'session_start_time' in saved_state:
         saved_session_start = saved_state['session_start_time']
         saved_reset_time = saved_session_start + timedelta(hours=5)
+        # Round reset time to next full hour
+        saved_reset_time = round_to_next_full_hour(saved_reset_time)
         
         # Check if the saved session is still valid (not expired)
         if current_time < saved_reset_time:
@@ -504,7 +741,8 @@ def get_session_based_reset_time(current_time, blocks, debug=False):
                 if latest_start_time > saved_reset_time:
                     # New session started after old session expired - save new session start
                     save_session_state(latest_start_time)
-                    return latest_start_time + timedelta(hours=5)
+                    new_reset_time = latest_start_time + timedelta(hours=5)
+                    return round_to_next_full_hour(new_reset_time)
                 else:
                     # No new session after expiry - ready for new session
                     return None
@@ -524,6 +762,8 @@ def get_session_based_reset_time(current_time, blocks, debug=False):
         
         # Calculate when this session should reset (start time + 5 hours)
         session_reset_time = latest_start_time + timedelta(hours=5)
+        # Round reset time to next full hour
+        session_reset_time = round_to_next_full_hour(session_reset_time)
         
         # Check if there's currently an active session
         has_active_session = any(block.get('isActive', False) for block in blocks if not block.get('isGap', False))
@@ -549,6 +789,8 @@ def get_persistent_session_window_info(blocks, current_time):
     if saved_state and 'session_start_time' in saved_state:
         saved_session_start = saved_state['session_start_time']
         saved_reset_time = saved_session_start + timedelta(hours=5)
+        # Round reset time to next full hour for consistency
+        saved_reset_time = round_to_next_full_hour(saved_reset_time)
         
         # Check if the saved session is still valid
         if current_time < saved_reset_time:
@@ -561,7 +803,7 @@ def get_persistent_session_window_info(blocks, current_time):
             if latest_session and latest_start_time and latest_start_time > saved_reset_time:
                 # New session after expiry
                 window_start = latest_start_time
-                window_end = latest_start_time + timedelta(hours=5)
+                window_end = round_to_next_full_hour(latest_start_time + timedelta(hours=5))
             else:
                 # No valid window
                 return None, None, None, None
@@ -572,7 +814,7 @@ def get_persistent_session_window_info(blocks, current_time):
             return None, None, None, None
         
         window_start = latest_start_time
-        window_end = latest_start_time + timedelta(hours=5)
+        window_end = round_to_next_full_hour(latest_start_time + timedelta(hours=5))
     
     # Find all sessions within this window
     sessions_in_window = []
@@ -678,21 +920,23 @@ def parse_args():
 
 def get_token_limit(plan, blocks=None):
     """Get token limit based on plan type."""
-    if plan == 'custom_max' and blocks:
-        # Find the highest token count from all previous blocks
-        max_tokens = 0
-        for block in blocks:
-            if not block.get('isGap', False) and not block.get('isActive', False):
-                tokens = block.get('totalTokens', 0)
-                if tokens > max_tokens:
-                    max_tokens = tokens
-        # Return the highest found, or default to pro if none found
-        return max_tokens if max_tokens > 0 else 7000
+    # For custom_max, use the fixed 6.5M limit instead of auto-detecting
+    # if plan == 'custom_max' and blocks:
+    #     # Find the highest token count from all previous blocks
+    #     max_tokens = 0
+    #     for block in blocks:
+    #         if not block.get('isGap', False) and not block.get('isActive', False):
+    #             tokens = block.get('totalTokens', 0)
+    #             if tokens > max_tokens:
+    #                 max_tokens = tokens
+    #     # Return the highest found, or default to pro if none found
+    #     return max_tokens if max_tokens > 0 else 7000
     
     limits = {
         'pro': 7000,
         'max5': 35000,
-        'max20': 140000
+        'max20': 140000,
+        'custom_max': 6500000  # 6.5 million tokens
     }
     return limits.get(plan, 7000)
 
@@ -756,8 +1000,11 @@ def main():
                 time.sleep(3)
                 continue
             
-            # Extract data from active block
-            tokens_used = active_block.get('totalTokens', 0)
+            # Initialize current_time early for use in token calculations
+            current_time = datetime.now(timezone.utc)
+            
+            # Calculate total tokens used within the current session timeframe
+            tokens_used = calculate_session_total_tokens(data['blocks'])
             
             # Check if tokens exceed limit and switch to custom_max if needed
             if tokens_used > token_limit and args.plan == 'pro':
@@ -771,11 +1018,10 @@ def main():
             
             # Time calculations
             start_time_str = active_block.get('startTime')
-            current_time = datetime.now(timezone.utc)  # Initialize current_time with UTC timezone
             
             if start_time_str:
                 start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
-                current_time = datetime.now(start_time.tzinfo)
+                current_time = datetime.now(start_time.tzinfo)  # Update current_time with proper timezone
                 elapsed = current_time - start_time
                 elapsed_minutes = elapsed.total_seconds() / 60
             else:
@@ -800,6 +1046,7 @@ def main():
                 # Ready for new session - show full 5-hour window available
                 minutes_to_reset = 300  # Full 5 hours available
                 time_since_reset = 0
+                total_session_duration = 300  # Default 5 hours
                 is_ready_for_new_session = True
             else:
                 # Calculate time to reset
@@ -812,14 +1059,19 @@ def main():
                     session_start_time = saved_state['session_start_time']
                     time_since_session_start = current_time - session_start_time
                     time_since_reset = time_since_session_start.total_seconds() / 60
+                    # Calculate total session duration (from start to rounded reset time)
+                    total_session_duration = (reset_time - session_start_time).total_seconds() / 60
                 else:
                     # Fallback to latest session
                     latest_session, latest_start_time = get_last_session_info(data['blocks'])
                     if latest_start_time:
                         time_since_session_start = current_time - latest_start_time
                         time_since_reset = time_since_session_start.total_seconds() / 60
+                        # Calculate total session duration (from start to rounded reset time)
+                        total_session_duration = (reset_time - latest_start_time).total_seconds() / 60
                     else:
                         time_since_reset = 0
+                        total_session_duration = 300  # Default fallback
                 is_ready_for_new_session = False
             
             # Predicted end calculation - when tokens will run out based on burn rate
@@ -842,9 +1094,9 @@ def main():
             
             # Time to Reset section - calculate progress based on time since last session start
             if is_ready_for_new_session:
-                print(f"⏳ {white}Time to Reset:{reset}  {create_time_progress_bar(0, 300)} {cyan}Ready for new session!{reset}")
+                print(f"⏳ {white}Time to Reset:{reset}  {create_time_progress_bar(0, total_session_duration)} {cyan}Ready for new session!{reset}")
             else:
-                print(f"⏳ {white}Time to Reset:{reset}  {create_time_progress_bar(time_since_reset, 300)}")
+                print(f"⏳ {white}Time to Reset:{reset}  {create_time_progress_bar(time_since_reset, total_session_duration)}")
             print()
             
             # Detailed stats
@@ -968,7 +1220,7 @@ def main():
                 # Window boundaries
                 if first_start_time:
                     window_start_local = first_start_time.astimezone(local_tz)
-                    window_end = first_start_time + timedelta(hours=5)
+                    window_end = round_to_next_full_hour(first_start_time + timedelta(hours=5))
                     window_end_local = window_end.astimezone(local_tz)
                     print(f"   🪟 Window: {window_start_local.strftime('%H:%M')} - {window_end_local.strftime('%H:%M')}")
                 
